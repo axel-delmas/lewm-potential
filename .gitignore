@@ -1,0 +1,8 @@
+out/
+results/
+.DS_Store
+__pycache__/
+*.tar.gz
+*.ckpt
+*.pt
+.venv/
