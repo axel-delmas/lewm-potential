@@ -1,13 +1,21 @@
-"""Regenerate out/results.csv, out/report.md and out/plots/* from the job directories."""
+"""Regenerate out/results.csv, out/report.md and out/plots/* from the job directories.
 
+With bridge results (--bridge_out, github.com/axel-delmas/fm-jepa) it also writes
+out/joined_results.csv: every potential eval next to the bridge eval with the same settings
+(P1<->A1, P2<->A2, same sigma multiple / lambda / head width / seed / epochs / S / K / mode),
+plus the imported baseline, paired per episode on the shared eval start states.
+
+Usage: python -m potential.report [out] [--bridge_out DIR_OR_BUNDLE ...]
+"""
+
+import argparse
 import csv
 import math
-import sys
 from pathlib import Path
 
 import numpy as np
 
-from fm import common as C
+from potential import common as C
 
 NOTES = Path(__file__).with_name("REPORT_NOTES.md")
 
@@ -49,12 +57,13 @@ def load_evals(job_dir):
 
 
 def describe(cfg):
+    imp = " (imported from bridge)" if cfg.get("imported_from") else ""
     if cfg.get("type") == "calibrate":
-        return "sigma calibration"
+        return "sigma calibration" + imp
     if cfg.get("type") == "eval_sweep":
         return f"planning sweep on {cfg.get('ref_job')}"
     if cfg["kind"] == "baseline":
-        d = "baseline LeWM"
+        d = "baseline LeWM" + imp
     else:
         d = f"{cfg['variant']} sigma={cfg['sigma']}xstd S={cfg['plan_S']}"
         if int(cfg.get("head_W", 256)) != 256:
@@ -149,7 +158,7 @@ def plots(out_dir, per_job):
             ax.grid(alpha=0.3)
         ax = axes.flat[-1]
         for jid, info in train_jobs.items():
-            if info["cfg"].get("kind") != "flow":
+            if info["cfg"].get("kind") != "potential":
                 continue
             last = info["metrics"][-1]
             ax.plot(range(5), [last.get(f"val_flow_tau{k}", float("nan")) for k in range(5)], marker="o", label=jid)
@@ -189,14 +198,14 @@ def plots(out_dir, per_job):
     return made
 
 
-def build_report(out_dir):
+def build_report(out_dir, bridge_dirs=()):
     out_dir = Path(out_dir)
     man, per_job, rows = collect(out_dir)
     write_results_csv(out_dir, rows)
     made = plots(out_dir, per_job)
     choices = man.get("choices", {})
     L = []
-    L.append("# Flow-matching predictor for LeWM — PushT phase\n")
+    L.append("# Potential-field predictor (v = −∇U) for LeWM — PushT phase\n")
     L.append(f"Generated {C.time.strftime('%Y-%m-%d %H:%M:%S')} · git `{man.get('git_commit', '?')}` · "
              f"GPU `{man.get('gpu', '?')}` · run args `{man.get('args', {})}`\n")
 
@@ -266,16 +275,16 @@ def build_report(out_dir):
     L.append("\n## Gate and selections\n")
     g = choices.get("gate")
     if g:
-        L.append(f"- **Gate (A1 σ=0, S=1 vs baseline, seed 0, final epoch):** {g.get('verdict')} — "
+        L.append(f"- **Gate (P1 σ=0, S=1 vs baseline, seed 0, final epoch):** {g.get('verdict')} — "
                  f"baseline {_f(g.get('baseline'))} ± {_f(g.get('baseline_se'))}, control {_f(g.get('control'))} ± "
                  f"{_f(g.get('control_se'))}, diff {_f(g.get('diff'))}, threshold ±{_f(g.get('threshold'))} "
                  f"(max(2 × combined SE, 2 points)).")
     elif 1 not in [int(t) for t in str((man.get("args") or {}).get("tiers", "1")).split(",") if t.strip().isdigit()]:
         L.append("- Gate: not run (tier 1 skipped: no sigma=0 control; the seed-0 baseline and the sigma "
-                 "calibration were run as prerequisites).")
+                 "calibration were imported as prerequisites).")
     else:
         L.append("- Gate: not evaluated yet.")
-    for k in ("best_A1", "best_A2", "best_T2"):
+    for k in ("best_P1", "best_P2", "best_T2"):
         c = choices.get(k)
         if c:
             L.append(f"- **{k}:** {c.get('variant')} σ={c.get('sigma')}×std from `{c.get('job_id')}` "
@@ -302,7 +311,7 @@ def build_report(out_dir):
         if not info["metrics"]:
             continue
         m = info["metrics"][-1]
-        taus = " / ".join(_g(m.get(f"val_flow_tau{k}")) for k in range(5)) if info["cfg"].get("kind") == "flow" else "–"
+        taus = " / ".join(_g(m.get(f"val_flow_tau{k}")) for k in range(5)) if info["cfg"].get("kind") == "potential" else "–"
         L.append(f"| `{jid}` | {int(m['epoch'])} | {_g(m.get('val_pred_loss'))} | {_g(m.get('val_onestep_mse'))} | "
                  f"{_g(m.get('val_sigreg'))} | {_g(m.get('z_std_mean'))} / {_g(m.get('z_std_min'))} | "
                  f"{_f(m.get('eff_rank'), 1)} | {_f(m.get('straightness'), 3)} | {taus} |")
@@ -324,7 +333,7 @@ def build_report(out_dir):
         flags = []
         if e10 and e20 and e20["success_rate"] - e10["success_rate"] > max(e20["se"], e10["se"]):
             flags.append(f"success {_f(e10['success_rate'])}→{_f(e20['success_rate'])}")
-        keys = [f"val_flow_tau{k}" for k in range(5)] if cfg.get("kind") == "flow" else ["val_pred_loss"]
+        keys = [f"val_flow_tau{k}" for k in range(5)] if cfg.get("kind") == "potential" else ["val_pred_loss"]
         for k in keys:
             a, b = m[10].get(k), m[20].get(k)
             if a and b and math.isfinite(a) and math.isfinite(b) and b < 0.98 * a:
@@ -332,6 +341,9 @@ def build_report(out_dir):
         L.append(f"- `{jid}`: {'**still improving** — ' + '; '.join(flags) if flags else 'flat'}")
     if not any_ext:
         L.append("- (needs epoch-10 and epoch-20 results)")
+
+    if bridge_dirs:
+        L += bridge_section(out_dir, per_job, bridge_dirs)
 
     if made:
         L.append("\n## Plots\n")
@@ -343,5 +355,142 @@ def build_report(out_dir):
     return out_dir / "report.md"
 
 
+# ----------------------------------------------------------------------------- join with the bridge repo
+BRIDGE_VARIANT = {"P1": "A1", "P2": "A2"}
+
+
+def _key(cfg, e, variant):
+    return (variant, float(cfg.get("sigma", 0.0) or 0.0), float(cfg.get("lambda", 0.09)), int(cfg.get("head_W") or 256),
+            cfg.get("seed"), cfg.get("epochs"), e.get("epoch"), e.get("S"), e.get("K"), e.get("mode"))
+
+
+def _episodes(e):
+    return {(int(i), int(s)): int(v) for i, s, v in zip(e.get("eval_episode_idx", []), e.get("eval_start_idx", []),
+                                                         e.get("episode_successes", []))}
+
+
+def _mcnemar(b, c):
+    """Exact two-sided McNemar p-value on the discordant pairs (b, c)."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
+
+
+def paired(e_ref, e_new):
+    """Per-episode pairing on the shared (episode, start) states. None if the eval sets differ."""
+    if e_ref.get("eval_set_hash") != e_new.get("eval_set_hash"):
+        return None
+    a, b = _episodes(e_ref), _episodes(e_new)
+    if set(a) != set(b):
+        return None
+    only_ref = sum(1 for k in a if a[k] and not b[k])
+    only_new = sum(1 for k in a if b[k] and not a[k])
+    return {"n": len(a), "only_ref": only_ref, "only_new": only_new, "p": _mcnemar(only_ref, only_new)}
+
+
+def joined_rows(out_dir, per_job, bridge_dirs):
+    bridge = {}  # key -> (job_id, eval, cfg, source)
+    gpus = {}
+    for bd in bridge_dirs:
+        bman, bjobs, _ = collect(bd)
+        for jid, info in bjobs.items():
+            cfg = info["cfg"]
+            if cfg.get("type", "train") != "train" or cfg.get("head_out_norm"):
+                continue
+            v = cfg.get("variant") or "baseline"
+            for e in info["evals"]:
+                bridge.setdefault(_key(cfg, e, v), (jid, e, cfg, str(bd)))
+                gpus.setdefault(str(bd), bman.get("gpu"))
+    base = {}
+    for jid, info in per_job.items():
+        if info["cfg"].get("kind") == "baseline":
+            for e in info["evals"]:
+                base[(info["cfg"].get("seed"), e.get("epoch"))] = (jid, e)
+    rows = []
+    for jid, info in per_job.items():
+        cfg = info["cfg"]
+        if cfg.get("kind") != "potential" or cfg.get("type", "train") != "train":
+            continue
+        for e in info["evals"]:
+            row = {"potential_job": jid, "variant": cfg.get("variant"), "sigma_mult": cfg.get("sigma"),
+                   "lambda": cfg.get("lambda"), "head_W": cfg.get("head_W"), "seed": cfg.get("seed"),
+                   "epochs": cfg.get("epochs"), "eval_epoch": e.get("epoch"), "S": e.get("S"), "K": e.get("K"),
+                   "mode": e.get("mode"), "n": e["n_episodes"], "potential_success": e["success_rate"],
+                   "potential_se": e["se"], "potential_solve_s": e.get("solve_s_per_env"),
+                   "potential_gpu": e.get("gpu"), "eval_set_hash": e.get("eval_set_hash")}
+            hit = bridge.get(_key(cfg, e, BRIDGE_VARIANT.get(cfg.get("variant"))))
+            if hit:
+                bj, be, _, src = hit
+                pr = paired(be, e)
+                row.update(bridge_job=bj, bridge_source=src, bridge_success=be["success_rate"], bridge_se=be["se"],
+                           bridge_solve_s=be.get("solve_s_per_env"), bridge_gpu=be.get("gpu"),
+                           diff_vs_bridge=e["success_rate"] - be["success_rate"],
+                           same_eval_set_bridge=pr is not None)
+                if pr:
+                    row.update(only_bridge=pr["only_ref"], only_potential=pr["only_new"], mcnemar_p_bridge=pr["p"])
+            bh = base.get((cfg.get("seed"), e.get("epoch")))
+            if bh:
+                pr = paired(bh[1], e)
+                row.update(baseline_job=bh[0], baseline_success=bh[1]["success_rate"], baseline_se=bh[1]["se"],
+                           diff_vs_baseline=e["success_rate"] - bh[1]["success_rate"],
+                           same_eval_set_baseline=pr is not None)
+                if pr:
+                    row.update(mcnemar_p_baseline=pr["p"])
+            rows.append(row)
+    return rows
+
+
+JOIN_KEYS = ["potential_job", "variant", "sigma_mult", "lambda", "head_W", "seed", "epochs", "eval_epoch", "S", "K",
+             "mode", "n", "potential_success", "potential_se", "bridge_job", "bridge_success", "bridge_se",
+             "diff_vs_bridge", "only_bridge", "only_potential", "mcnemar_p_bridge", "same_eval_set_bridge",
+             "baseline_job", "baseline_success", "baseline_se", "diff_vs_baseline", "mcnemar_p_baseline",
+             "same_eval_set_baseline", "eval_set_hash", "potential_solve_s", "bridge_solve_s", "potential_gpu",
+             "bridge_gpu", "bridge_source"]
+
+
+def bridge_section(out_dir, per_job, bridge_dirs):
+    rows = joined_rows(out_dir, per_job, bridge_dirs)
+    p = Path(out_dir) / "joined_results.csv"
+    with open(p, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=JOIN_KEYS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k) for k in JOIN_KEYS})
+    L = ["\n## Comparison with the bridge variant (fm-jepa)\n",
+         "Each potential eval is matched to the bridge eval with the same settings (P1↔A1, P2↔A2; same σ multiple, "
+         "λ, head width, seed, epochs, S, K, mode). Both are evaluated on the same 200 start states "
+         "(`eval_set_hash` checked), so the comparison is paired per episode: 'only bridge / only potential' count "
+         "episodes solved by one model and not the other; p is an exact two-sided McNemar test. Planning times "
+         "are only comparable when both GPUs are the same. Full table: `joined_results.csv`.\n",
+         "| potential job | eval | potential | bridge (job) | Δ vs bridge | only bridge / only potential | p | "
+         "baseline | Δ vs baseline | p | s/solve pot / bridge |",
+         "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        ev = f"ep{r['eval_epoch']} S{r['S']} K{r['K']} {r['mode']}"
+        br = (f"{_f(r['bridge_success'])} ± {_f(r['bridge_se'])} (`{r['bridge_job']}`)" if r.get("bridge_job")
+              else "– (no matching bridge eval)")
+        if r.get("bridge_job") and not r.get("same_eval_set_bridge"):
+            br += " **eval set differs**"
+        L.append(f"| `{r['potential_job']}` | {ev} | {_f(r['potential_success'])} ± {_f(r['potential_se'])} | {br} | "
+                 f"{_f(r.get('diff_vs_bridge'))} | {r.get('only_bridge', '–')} / {r.get('only_potential', '–')} | "
+                 f"{_g(r.get('mcnemar_p_bridge'), 2)} | {_f(r.get('baseline_success'))} | "
+                 f"{_f(r.get('diff_vs_baseline'))} | {_g(r.get('mcnemar_p_baseline'), 2)} | "
+                 f"{_f(r.get('potential_solve_s'), 2)} / {_f(r.get('bridge_solve_s'), 2)} |")
+    if not rows:
+        L.append("| (no potential evals yet) |||||||||||")
+    return L
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out", nargs="?", default="out")
+    ap.add_argument("--bridge_out", action="append", default=[], help="bridge out/ dir or bundle .tar.gz (repeatable)")
+    args = ap.parse_args()
+    dirs = [C.materialise_out_dir(s, Path(args.out) / "bridge_src") for s in args.bridge_out]
+    print(build_report(args.out, bridge_dirs=dirs))
+
+
 if __name__ == "__main__":
-    print(build_report(sys.argv[1] if len(sys.argv) > 1 else "out"))
+    main()

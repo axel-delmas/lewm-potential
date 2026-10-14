@@ -2,7 +2,7 @@
 
 1. VSCode terminal (Terminal > New Terminal) is already on the GPU machine. Get the code there
    (git clone your repo, or VSCode "File > Open Folder" on a copy you rsync'd).
-2. `cd le-wm && bash ssh_check.sh`  -> shows free GPUs, disk, internet.
+2. `cd lewm-potential && bash ssh_check.sh`  -> shows free GPUs, disk, internet.
 3. Choose a big-disk folder and a free GPU (index from step 2):
    ```
    export WORKDIR=/path/with/90GB/free/lewm      # e.g. /scratch/$USER/lewm  (check with df -h)

@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from fm import common as C
+from potential import common as C
 
 
 def main():
@@ -22,7 +22,7 @@ def main():
     args = p.parse_args()
     device = torch.device(args.device)
 
-    cfg = C.load_train_cfg(os.environ.get("FM_DEBUG_OVERRIDES", "").split())
+    cfg = C.load_train_cfg(os.environ.get("POT_DEBUG_OVERRIDES", "").split())
     _, train_set, val_set = C.build_datasets(cfg)
     train_loader, _, sampler = C.build_loaders(cfg, train_set, val_set, shuffle_seed=args.seed,
                                                num_workers=args.num_workers)

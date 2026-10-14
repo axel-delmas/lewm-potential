@@ -1,4 +1,4 @@
-"""PushT planning evaluation for baseline and flow checkpoints.
+"""PushT planning evaluation for baseline and potential checkpoints.
 
 Mirrors eval.py::run line by line (same config/eval/pusht.yaml, same CEM solver config,
 same normalisation, same episode/start sampling incl. its quirks); only the model
@@ -7,8 +7,8 @@ differ. Videos are not written (eval.py writes one per episode; it does not affe
 results).
 
 Usage:
-  python -m fm.eval_fm --ckpt <path> --out <json> [--S 4 --K 1 --mode sample]
-  python -m fm.eval_fm --ckpt <path> --out <json> --benchmark "1x1,4x1,8x1,4x4"
+  python -m potential.eval_fm --ckpt <path> --out <json> [--S 4 --K 1 --mode sample]
+  python -m potential.eval_fm --ckpt <path> --out <json> --benchmark "1x1,4x1,8x1,4x4"
 """
 
 import argparse
@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fm import common as C
+from potential import common as C
 
 import hydra  # noqa: E402
 import stable_worldmodel as swm  # noqa: E402
@@ -94,12 +94,12 @@ def main():
     prog_path = Path(args.progress) if args.progress else out_path.with_name("progress_eval.json")
 
     n_eval = 2 if args.smoke else args.num_eval
-    overrides = [f"eval.num_eval={n_eval}", "policy=fm"]
+    overrides = [f"eval.num_eval={n_eval}", "policy=potential"]
     if device.type != "cuda":
         overrides.append(f"solver.device={device.type}")
     if args.smoke:
         overrides += ["solver.num_samples=8", "solver.n_steps=2", "solver.topk=2"]
-    overrides += os.environ.get("FM_DEBUG_EVAL_OVERRIDES", "").split()  # testing only
+    overrides += os.environ.get("POT_DEBUG_EVAL_OVERRIDES", "").split()  # testing only
     cfg = C.load_eval_cfg(overrides)
 
     # ---------------- from eval.py::run (unchanged logic) ----------------
@@ -136,7 +136,7 @@ def main():
         model.plan_S, model.plan_K, model.plan_mode, model.plan_seed = S_steps, args.K, args.mode, args.plan_seed
         model.reset_plan_rng()
     elif args.K != 1 or args.mode != "sample" or (args.S not in (None, 1)):
-        raise ValueError("S/K/mode only apply to flow models")
+        raise ValueError("S/K/mode only apply to sampled (potential) models")
 
     config = swm.PlanConfig(**cfg.plan_config)
     solver = hydra.utils.instantiate(cfg.solver, model=model)

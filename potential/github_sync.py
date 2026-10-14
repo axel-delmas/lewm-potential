@@ -16,8 +16,8 @@ token embedded in the git remote URL (https://<token>@github.com/...). Repo: GIT
 (owner/name), else parsed from the git remote.
 
 CLI:
-  python -m fm.github_sync check                    # can we write? (creates nothing)
-  python -m fm.github_sync download --dest DIR [--tag TAG]   # rebuild an out/ dir from a release
+  python -m potential.github_sync check                    # can we write? (creates nothing)
+  python -m potential.github_sync download --dest DIR [--tag TAG]   # rebuild an out/ dir from a release
 """
 
 import argparse
@@ -38,7 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
 MAX_ASSET = 2 * 1000**3 - 1
-TAG_PREFIX = "fm-results-"
+TAG_PREFIX = "potential-results-"
 
 
 def _remote_url():
@@ -80,7 +80,7 @@ class GitHubSync:
     # ------------------------------------------------------------------ http
     def _req(self, method, url, data=None, headers=None, raw=False, timeout=120):
         h = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
-             "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "fm-jepa-sync"}
+             "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "lewm-potential-sync"}
         h.update(headers or {})
         if data is not None and not isinstance(data, (bytes, bytearray)) and not hasattr(data, "read"):
             data = json.dumps(data).encode()
@@ -117,7 +117,7 @@ class GitHubSync:
                 return rel
         self.release = self._req("POST", f"{API}/repos/{self.repo}/releases", {
             "tag_name": tag, "name": tag, "draft": True,
-            "body": "Results and checkpoints uploaded automatically by fm/orchestrate.py."})
+            "body": "Results and checkpoints uploaded automatically by potential/orchestrate.py."})
         self.log(f"created draft GitHub release '{tag}' on {self.repo}")
         return self.release
 

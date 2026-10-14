@@ -1,4 +1,4 @@
-"""Train one job (baseline LeWM or flow variant) with resumable checkpoints.
+"""Train one job (baseline LeWM or potential variant) with resumable checkpoints.
 
 Reproduces train.py's training computation without Lightning so that checkpoints carry
 optimizer / scheduler / RNG state and can resume mid-epoch:
@@ -9,7 +9,7 @@ optimizer / scheduler / RNG state and can resume mid-epoch:
   - bf16 autocast (Lightning precision "bf16" == "bf16-mixed"), grad-norm clip 1.0
   - baseline loss = train.py::lejepa_forward itself
 
-Usage: python -m fm.train_fm --job_dir out/jobs/<job_id> [--deadline <unix ts>]
+Usage: python -m potential.train_fm --job_dir out/jobs/<job_id> [--deadline <unix ts>]
 Exit codes: 0 done, 3 interrupted (deadline / SIGTERM; checkpoint written), 1 error.
 """
 
@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fm import common as C
+from potential import common as C
 
 EXIT_INTERRUPTED = 3
 PROCESS_T0 = time.time()
@@ -65,14 +65,14 @@ def setup(job, args, device):
         f"trainer.max_epochs={job['epochs']}",
     ]
     # debug/testing only (e.g. a remote dataset or a tiny batch); recorded in the log
-    overrides += os.environ.get("FM_DEBUG_OVERRIDES", "").split()
+    overrides += os.environ.get("POT_DEBUG_OVERRIDES", "").split()
     cfg = C.load_train_cfg(overrides)
     dataset, train_set, val_set = C.build_datasets(cfg)
     train_loader, val_loader, sampler = C.build_loaders(
         cfg, train_set, val_set, shuffle_seed=job["seed"], num_workers=args.num_workers
     )
     sigma_std = None
-    if job["kind"] == "flow" and float(job["sigma"]) > 0:
+    if job["kind"] == "potential" and float(job["sigma"]) > 0:
         calib = C.read_json(job["calibration_path"])
         if calib is None:
             raise RuntimeError(f"calibration missing: {job['calibration_path']}")
@@ -94,7 +94,7 @@ def setup(job, args, device):
     sched = LinearWarmupCosineAnnealingLR(
         opt, warmup_steps=max(1, int(0.01 * total_steps)), max_steps=total_steps, warmup_start_lr=0.0, eta_min=0.0
     )
-    forward = C.baseline_forward if job["kind"] == "baseline" else C.flow_forward
+    forward = C.baseline_forward if job["kind"] == "baseline" else C.potential_forward
     return dict(cfg=cfg, mc=mc, model=model, sigreg=sigreg, ema=ema, shim=shim, opt=opt, sched=sched,
                 train_loader=train_loader, val_loader=val_loader, sampler=sampler, forward=forward,
                 steps_per_epoch=steps_per_epoch, total_steps=total_steps, n_train=len(train_set), n_val=len(val_set))
@@ -178,7 +178,7 @@ def diagnostics(S, job, device, n_batches):
             rows["straightness"].append(cos.mean().item())
             if sum(e.shape[0] for e in embs) < 8192:
                 embs.append(emb.reshape(-1, emb.size(-1)).cpu())
-            if job["kind"] == "flow":
+            if job["kind"] == "potential":
                 b = torch.clamp((out["tau"] * 5).long(), max=4).cpu().numpy()
                 pp = out["per_pair"].float().cpu().numpy()
                 np.add.at(bins, b, pp)
@@ -233,12 +233,12 @@ def main():
     pc = C.param_counts(model)
     log(f"job {job['job_id']} | params {pc} | train {S['n_train']} val {S['n_val']} | "
         f"steps/epoch {S['steps_per_epoch']} total {S['total_steps']}")
-    if "velocity_head" in pc:
-        base_total = pc["total"] - pc["velocity_head"] + 792768  # baseline has pred_proj (Linear-BN-GELU-Linear 192/2048)
-        log(f"velocity head {pc['velocity_head']:,} params | trunk+head {pc['predictor_trunk'] + pc['velocity_head']:,} "
+    if "potential_head" in pc:
+        base_total = pc["total"] - pc["potential_head"] + 792768  # baseline has pred_proj (Linear-BN-GELU-Linear 192/2048)
+        log(f"potential head {pc['potential_head']:,} params | trunk+head {pc['predictor_trunk'] + pc['potential_head']:,} "
             f"vs baseline trunk+pred_proj {pc['predictor_trunk'] + 792768:,} | total {pc['total']:,} vs baseline {base_total:,}")
-    if os.environ.get("FM_DEBUG_OVERRIDES"):
-        log(f"DEBUG overrides active: {os.environ['FM_DEBUG_OVERRIDES']}")
+    if os.environ.get("POT_DEBUG_OVERRIDES"):
+        log(f"DEBUG overrides active: {os.environ['POT_DEBUG_OVERRIDES']}")
     C.write_json_atomic(job_dir / "params.json", pc)
 
     if args.preflight:

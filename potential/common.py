@@ -212,14 +212,13 @@ def build_loaders(cfg, train_set, val_set, shuffle_seed, num_workers=None):
 # ----------------------------------------------------------------------------- models
 def head_cfg(job, embed_dim):
     return {
-        "_target_": "fm.flow_head.VelocityHead",
+        "_target_": "potential.potential_head.PotentialHead",
         "d": embed_dim,
         "W": int(job.get("head_W", 256)),
         "n_blocks": int(job.get("head_blocks", 4)),
         "mlp_ratio": 4,
         "a_dim": embed_dim,
         "p_drop": float(job.get("head_dropout", 0.0)),
-        "out_norm": job.get("head_out_norm") or None,
     }
 
 
@@ -229,13 +228,14 @@ def model_config(cfg, job, sigma_std=None):
     if job["kind"] == "baseline":
         return mc
     mc.pop("pred_proj")
-    mc["_target_"] = "fm.flow_jepa.FlowJEPA"
+    mc["_target_"] = "potential.potential_jepa.PotentialJEPA"
     mc["head"] = head_cfg(job, int(cfg.embed_dim))
     mc["variant"] = job["variant"]
     mc["sigma_mult"] = float(job["sigma"])
     mc["sigma_std"] = None if float(job["sigma"]) == 0.0 else list(map(float, sigma_std))
     mc["embed_dim"] = int(cfg.embed_dim)
     mc["detach_target"] = bool(job.get("detach_target", False))
+    mc["head_fp32"] = bool(job.get("head_fp32", False))
     return mc
 
 
@@ -264,7 +264,7 @@ def param_counts(model):
         "action_embedder": n(model.action_encoder),
     }
     if hasattr(model, "head"):
-        out["velocity_head"] = n(model.head)
+        out["potential_head"] = n(model.head)
     out["total"] = n(model)
     return out
 
@@ -288,8 +288,8 @@ def baseline_forward(shim, batch, stage, cfg):
     return lejepa_forward(shim, batch, stage, cfg)
 
 
-def flow_forward(shim, batch, stage, cfg):
-    """Mirror of lejepa_forward with the MSE replaced by the flow loss (mean over dims)."""
+def potential_forward(shim, batch, stage, cfg):
+    """Mirror of lejepa_forward with the MSE replaced by the flow loss of v = -grad U (mean over dims)."""
     model = shim.model
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
@@ -384,3 +384,29 @@ def autocast_ctx(cfg, device):
 
 def stablewm_home():
     return Path(os.environ.get("STABLEWM_HOME", os.path.expanduser("~/.stable_worldmodel")))
+
+
+# ----------------------------------------------------------------------------- bridge results (fm-jepa)
+def materialise_out_dir(src, cache_root):
+    """A bridge-repo results source as a local out/ dir (the directory holding manifest.json).
+    `src` is an out/ directory (used in place, read-only) or a bundle .tar.gz, whose non-checkpoint
+    members are extracted once under cache_root."""
+    import tarfile
+
+    src = Path(src).expanduser().resolve()
+    if src.is_dir():
+        root = src
+    elif src.is_file():
+        root = Path(cache_root) / src.name.removesuffix(".tar.gz").removesuffix(".tgz")
+        if not (root / ".extracted").exists():
+            with tarfile.open(src, "r:*") as tar:
+                members = [m for m in tar.getmembers() if m.isfile() and not m.name.endswith((".pt", ".ckpt"))]
+                tar.extractall(root, members=members, filter="data")
+            (root / ".extracted").touch()
+    else:
+        raise FileNotFoundError(f"bridge results source not found: {src}")
+    hits = sorted((p.parent for p in root.rglob("manifest.json") if "jobs" not in p.relative_to(root).parts),
+                  key=lambda p: len(p.parts))
+    if not hits:
+        raise FileNotFoundError(f"no manifest.json (bridge out/ dir) under {src}")
+    return hits[0]

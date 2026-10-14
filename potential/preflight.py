@@ -1,7 +1,7 @@
 """Pre-flight: fail fast before any training.
 
 Checks GPU, both PushT dataset files (exist + load), free disk, one fwd/bwd pass of the
-baseline and the flow models (A1 and A2) on a real batch with the training numerics, and
+baseline and the potential models (P1 and P2) on a real batch with the training numerics, and
 an eval smoke test (HDF5 eval dataset + PushT env + CEM) on random-init checkpoints.
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from fm import common as C
+from potential import common as C
 
 
 def main():
@@ -49,7 +49,7 @@ def main():
     home = C.stablewm_home()
     lance = home / "datasets" / "pusht_expert_train.lance"
     h5 = home / "datasets" / "pusht_expert_train.h5"
-    debug = os.environ.get("FM_DEBUG_OVERRIDES", "")
+    debug = os.environ.get("POT_DEBUG_OVERRIDES", "")
     check("lance_train_data", lance.is_dir() or "data.dataset.name=" in debug,
           f"{lance} ({_du(lance):.1f} GB)" if lance.exists() else f"missing: {lance}")
     check("hdf5_eval_data", h5.is_file(), f"{h5} ({_du(h5):.1f} GB)" if h5.exists() else f"missing: {h5}")
@@ -95,13 +95,13 @@ def main():
     sigreg = C.make_sigreg(cfg).to(device)
     ckpts = {}
     for job in (dict(job_id="pf_baseline", kind="baseline"),
-                dict(job_id="pf_A1", kind="flow", variant="A1", sigma=0.0, plan_S=1),
-                dict(job_id="pf_A2", kind="flow", variant="A2", sigma=1.0, plan_S=4)):
+                dict(job_id="pf_P1", kind="potential", variant="P1", sigma=0.0, plan_S=1),
+                dict(job_id="pf_P2", kind="potential", variant="P2", sigma=1.0, plan_S=4)):
         try:
             mc = C.model_config(cfg, job, sigma_std=[1.0] * int(cfg.embed_dim))
             torch.manual_seed(0)
             model = C.instantiate_model(mc).to(device)
-            fwd = C.baseline_forward if job["kind"] == "baseline" else C.flow_forward
+            fwd = C.baseline_forward if job["kind"] == "baseline" else C.potential_forward
             b = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
             if gpu:
                 torch.cuda.reset_peak_memory_stats()
@@ -114,7 +114,11 @@ def main():
             check(f"fwd_bwd_{job['job_id']}", ok, f"loss {o['loss'].item():.4f} pred {o['pred_loss'].item():.4f} "
                                                   f"sigreg {o['sigreg_loss'].item():.4f} grad {float(gn):.3f} "
                                                   f"peak mem {mem:.1f} GB | params {C.param_counts(model)['total']}")
-            if job["job_id"] in ("pf_baseline", "pf_A2"):
+            if job["kind"] == "potential":
+                res.setdefault("bf16_field_rel_err", {})[job["job_id"]] = rel = _bf16_field_err(model, o, cfg, device)
+                print(f"[preflight] note: {job['job_id']} grad_x U bf16 vs fp32 relative error {rel:.4f} on a real batch "
+                      f"(random non-zero output layer){' -- large: consider --head_fp32' if rel > 0.05 else ''}", flush=True)
+            if job["job_id"] in ("pf_baseline", "pf_P2"):
                 path = pre / f"{job['job_id']}.pt"
                 C.torch_save_atomic({"model": model.state_dict(), "model_cfg": mc, "epoch": 0, "job": job}, path)
                 ckpts[job["job_id"]] = path
@@ -126,12 +130,34 @@ def main():
     if not args.skip_eval_smoke and not fails:
         for name, path in ckpts.items():
             outj = pre / f"smoke_{name}.json"
-            cmd = [sys.executable, "-m", "fm.eval_fm", "--ckpt", str(path), "--out", str(outj), "--smoke"]
+            cmd = [sys.executable, "-m", "potential.eval_fm", "--ckpt", str(path), "--out", str(outj), "--smoke"]
             t = time.time()
             r = subprocess.run(cmd, capture_output=True, text=True)
             ok = r.returncode == 0 and outj.exists()
             check(f"eval_smoke_{name}", ok, f"{time.time() - t:.0f}s" if ok else (r.stdout + r.stderr)[-2000:])
     return finish(out, res, fails)
+
+
+def _bf16_field_err(model, o, cfg, device):
+    """||v_bf16 - v_fp32|| / ||v_fp32|| for v = -grad_x U on real (h, z_t, a_t) pairs, with a copy of the
+    model whose zero-initialised output/modulation layers are randomised (else v == 0)."""
+    import copy
+
+    m = copy.deepcopy(model).float().eval()
+    g = torch.Generator(device=device).manual_seed(0)
+    with torch.no_grad():
+        for name, p in m.head.named_parameters():
+            if name.startswith("out.") or ".mod." in name:
+                p.copy_(torch.randn(p.shape, generator=g, device=device) / max(p.shape[-1], 1) ** 0.5)
+    H = int(cfg.history_size)
+    flat = lambda t: t.detach().float()[:, :H].reshape(-1, t.size(-1))
+    h, z, a = o["h"].detach().float().reshape(-1, o["h"].size(-1)), flat(o["emb"]), flat(o["act_emb"])
+    x = z + 0.1 * torch.randn(z.shape, generator=g, device=device)
+    tau = torch.rand(z.size(0), generator=g, device=device)
+    v32 = m.velocity(x, tau, h, z, a)
+    with C.autocast_ctx(cfg, device):
+        v16 = m.velocity(x, tau, h, z, a)
+    return float((v16.float() - v32).norm() / v32.norm().clamp_min(1e-30))
 
 
 def _du(path):

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Idempotent setup for the PushT flow-matching study on an (ephemeral) RunPod GPU pod.
+# Idempotent setup for the PushT potential-field study on an (ephemeral) RunPod GPU pod.
 #  - optional: clone $REPO_URL (else use the repo this script lives in)
 #  - checks GPU (nvidia-smi), free disk, network
 #  - Python 3.10 venv (uv) with torch matching the driver + pinned stable-worldmodel / stable-pretraining
 #  - downloads the two PushT datasets into $STABLEWM_HOME/datasets/ (as-is, no conversion):
-#      pusht_expert_train.lance  <- HF dataset galilai-group/lewm-pusht  (read by train.py / fm.train_fm)
+#      pusht_expert_train.lance  <- HF dataset galilai-group/lewm-pusht  (read by train.py / potential.train_fm)
 #      pusht_expert_train.h5     <- HF dataset quentinll/lewm-pusht, file pusht_expert_train.h5.zst
 #                                   (a raw zstd stream of the .h5, decompressed with zstd -d; read by eval.py)
-#  - writes $OUT_DIR/env/{pip_freeze.txt,setup.json} and ~/.fm_env for run_all.sh
+#  - writes $OUT_DIR/env/{pip_freeze.txt,setup.json} and ~/.pot_env for run_all.sh
 set -euo pipefail
 
 log() { echo "[setup $(date +%H:%M:%S)] $*"; }
@@ -22,7 +22,7 @@ command -v nvidia-smi >/dev/null || die "nvidia-smi not found: no NVIDIA GPU/dri
 
 # ---------------------------------------------------------------- 0. repo
 if [[ -n "${REPO_URL:-}" ]]; then
-  REPO_DIR="${REPO_DIR:-$WS/le-wm}"
+  REPO_DIR="${REPO_DIR:-$WS/lewm-potential}"
   if [[ -d "$REPO_DIR/.git" ]]; then
     log "repo already cloned at $REPO_DIR ($(git -C "$REPO_DIR" rev-parse --short HEAD))"
   else
@@ -32,7 +32,7 @@ if [[ -n "${REPO_URL:-}" ]]; then
 else
   REPO_DIR="$HERE"
 fi
-[[ -f "$REPO_DIR/fm/orchestrate.py" && -f "$REPO_DIR/jepa.py" ]] || die "$REPO_DIR is not the le-wm repo with fm/"
+[[ -f "$REPO_DIR/potential/orchestrate.py" && -f "$REPO_DIR/jepa.py" ]] || die "$REPO_DIR is not the lewm-potential repo with potential/"
 OUT_DIR="${OUT_DIR:-$REPO_DIR/out}"
 mkdir -p "$OUT_DIR/env"
 export STABLEWM_HOME="${STABLEWM_HOME:-$WS/stablewm}"
@@ -64,7 +64,7 @@ if ! command -v uv >/dev/null; then
   curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
   export PATH="$HOME/.local/bin:$PATH"
 fi
-VENV="${VENV:-$WS/fm-venv}"
+VENV="${VENV:-$WS/pot-venv}"
 [[ -x "$VENV/bin/python" ]] || uv venv --python 3.10 "$VENV"   # README: python 3.10
 PY="$VENV/bin/python"
 
@@ -188,10 +188,10 @@ json.dump({"gpu": gpu, "cuda_driver": "$CUDA_DRV", "torch": torch.__version__, "
            "torch_index": "$IDX", "venv": "$VENV", "repo": "$REPO_DIR", "stablewm_home": "$STABLEWM_HOME",
            "free_gb": shutil.disk_usage("$STABLEWM_HOME").free / 1e9}, open(sys.argv[1], "w"), indent=2)
 EOF
-cat > "$HOME/.fm_env" <<EOF
+cat > "$HOME/.pot_env" <<EOF
 export REPO_DIR="$REPO_DIR"
 export VENV="$VENV"
 export STABLEWM_HOME="$STABLEWM_HOME"
 export OUT_DIR="$OUT_DIR"
 EOF
-log "done. env recorded in $OUT_DIR/env/ (pip_freeze.txt, setup.json); variables in ~/.fm_env"
+log "done. env recorded in $OUT_DIR/env/ (pip_freeze.txt, setup.json); variables in ~/.pot_env"

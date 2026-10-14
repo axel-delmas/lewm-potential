@@ -1,4 +1,8 @@
-"""Unattended job runner for the PushT flow-matching study (called by run_all.sh).
+"""Unattended job runner for the PushT potential-field study (called by run_all.sh).
+
+The baseline and the sigma calibration are not re-run here: they are imported from the bridge
+repo's results (--bridge_out, github.com/axel-delmas/fm-jepa), so that P1/P2 are compared with the
+exact baseline the bridge variants were compared with (same eval start states, same epochs).
 
 Runs the tiered job plan top to bottom with dependencies, writes out/manifest.json,
 out/progress.json, out/results.csv, out/report.md, rebuilds out -> bundle.tar.gz after
@@ -20,12 +24,12 @@ import time
 import traceback
 from pathlib import Path
 
-from fm import common as C
+from potential import common as C
 
 PY = sys.executable
 ONE_GB = 1 << 30
 HF_EVERY_S = 15 * 60
-FALLBACK_IT_S = {"baseline": 6.0, "flow": 5.5}
+FALLBACK_IT_S = {"baseline": 6.0, "potential": 5.5}
 FALLBACK_SOLVE_S = 1.0
 RESERVE_S = 600  # time kept for the final bundle + upload when --max_hours is set
 
@@ -47,13 +51,18 @@ def parse():
                    help="dataloader workers; default max(6 (repo), min(cpus-2, 16)). Throughput only, not numerics")
     p.add_argument("--val_batches", type=int, default=100)
     p.add_argument("--sweep_grid", action="store_true", help="tier-4 planning sweep as full S x K grid")
-    p.add_argument("--t2_variants", default="A1,A2", help="tier-2 variants to train (budget control)")
+    p.add_argument("--t2_variants", default="P1,P2", help="tier-2 variants to train (budget control)")
     p.add_argument("--t2_sigmas", default="0.5,1", help="tier-2 sigma multipliers to train (budget control)")
     p.add_argument("--final_eval_only", action="store_true",
                    help="evaluate only the final checkpoint (skip epoch-5/10 milestone evals; weights still saved)")
-    p.add_argument("--detach_target", action="store_true", help="flow jobs: stop-gradient on z_{t+1} (off by default)")
-    p.add_argument("--ema", action="store_true", help="flow jobs: EMA target encoder (off by default)")
-    p.add_argument("--head_dropout", type=float, default=0.0, help="flow jobs: velocity-head dropout (default 0)")
+    p.add_argument("--detach_target", action="store_true", help="potential jobs: stop-gradient on z_{t+1} (off by default)")
+    p.add_argument("--ema", action="store_true", help="potential jobs: EMA target encoder (off by default)")
+    p.add_argument("--head_dropout", type=float, default=0.0, help="potential jobs: potential-head dropout (default 0)")
+    p.add_argument("--head_fp32", action="store_true",
+                   help="potential jobs: run the potential head and grad_x U in fp32 inside the bf16 step (default off)")
+    p.add_argument("--bridge_out", action="append", default=[],
+                   help="bridge-repo results (out/ dir or bundle .tar.gz; repeatable): source of the imported "
+                        "baseline jobs and calibration.json, and of the joined comparison in the report")
     p.add_argument("--extend_mode", default="fresh", choices=["fresh", "continue"])
     p.add_argument("--no_auto_benchmark", action="store_true")
     p.add_argument("--no_auto_diagnose", action="store_true")
@@ -69,7 +78,7 @@ def parse():
 class Log:
     def __init__(self, out: Path):
         self.f = None
-        if os.environ.get("FM_STDOUT_IS_RUNLOG") != "1":
+        if os.environ.get("POT_STDOUT_IS_RUNLOG") != "1":
             out.mkdir(parents=True, exist_ok=True)
             self.f = open(out / "run.log", "a", buffering=1)
         self.lock = threading.Lock()
@@ -89,7 +98,7 @@ MILESTONES = (5, 10, 20, 50, 100)
 def default_S(kind, variant, sigma):
     if kind == "baseline":
         return None
-    return 1 if (variant == "A1" and float(sigma) == 0.0) else 4
+    return 1 if (variant == "P1" and float(sigma) == 0.0) else 4
 
 
 def eval_tag(epoch, S, K, mode):
@@ -117,7 +126,7 @@ def train_config(args, tier, kind, seed, variant=None, sigma=0.0, lam=0.09, W=25
     jid = job_id
     if jid is None:
         jid = canonical_id(kind, variant, sigma, seed, E, lam, W, out_norm)
-        if kind == "flow" and flag_suffix(args):  # non-default training flags never share ids with default runs
+        if kind == "potential" and flag_suffix(args):  # non-default training flags never share ids with default runs
             jid = jid.replace(f"_seed{seed}", f"{flag_suffix(args)}_seed{seed}")
     cfg = {
         "job_id": jid,
@@ -125,16 +134,21 @@ def train_config(args, tier, kind, seed, variant=None, sigma=0.0, lam=0.09, W=25
         "milestones": milestones, "num_eval": args.num_eval,
         "evals": [{"tag": eval_tag(e, S, 1, "sample"), "epoch": e, "S": S, "K": 1, "mode": "sample"} for e in eval_epochs],
     }
-    if kind == "flow":
+    if kind == "potential":
         cfg.update(variant=variant, sigma=float(sigma), plan_S=S, head_W=int(W), head_blocks=4,
                    head_dropout=float(args.head_dropout), head_out_norm=out_norm,
-                   detach_target=bool(args.detach_target), ema=bool(args.ema))
+                   detach_target=bool(args.detach_target), ema=bool(args.ema), head_fp32=bool(args.head_fp32))
     return cfg
+
+
+def imported(cfg):
+    """Mark a baseline / calibration job as imported from the bridge repo instead of run here."""
+    return dict(cfg, imported_from="bridge")
 
 
 def flag_suffix(args):
     return ("_detach" if args.detach_target else "") + ("_ema" if args.ema else "") + \
-        (f"_hdrop{args.head_dropout:g}" if args.head_dropout else "")
+        (f"_hdrop{args.head_dropout:g}" if args.head_dropout else "") + ("_fp32" if args.head_fp32 else "")
 
 
 def build_plan(args, tiers, seeds):
@@ -149,39 +163,40 @@ def build_plan(args, tiers, seeds):
         return cfg["job_id"]
 
     base0 = train_config(args, 1, "baseline", s0)["job_id"]
-    ctrl0 = train_config(args, 1, "flow", s0, "A1", 0.0)["job_id"]
+    ctrl0 = train_config(args, 1, "potential", s0, "P1", 0.0)["job_id"]
     calib_id = f"calibration_seed{s0}_e{E}"
     # without tier 1 there is no sigma=0 control and no gate; the seed-0 baseline and the calibration are still
-    # run as prerequisites (sigma is a multiple of the calibrated std; the baseline is the comparison number)
+    # imported as prerequisites (sigma is a multiple of the calibrated std; the baseline is the comparison number).
+    # Both come from the bridge repo's results (same job ids), never re-run here.
     gate = ["gate"] if 1 in tiers else []
     if 1 in tiers or any(t in tiers for t in (2, 3, 4)):
-        add(1, train_config(args, 1, "baseline", s0))
-        plan.append({"id": calib_id, "tier": 1, "config": {"job_id": calib_id, "tier": 1, "type": "calibrate",
-                                                             "ref_job": base0, "seed": s0, "num_batches": 200}})
+        add(1, imported(train_config(args, 1, "baseline", s0)))
+        plan.append({"id": calib_id, "tier": 1, "config": imported({"job_id": calib_id, "tier": 1, "type": "calibrate",
+                                                                      "ref_job": base0, "seed": s0, "num_batches": 200})})
     if 1 in tiers:
-        add(1, train_config(args, 1, "flow", s0, "A1", 0.0))
+        add(1, train_config(args, 1, "potential", s0, "P1", 0.0))
     t2 = []
     if 2 in tiers:
         for v in [x.strip() for x in str(args.t2_variants).split(",") if x.strip()]:
             for sg in [float(x) for x in str(args.t2_sigmas).split(",") if x.strip()]:
-                t2.append(add(2, train_config(args, 2, "flow", s0, v, sg), ["calibration", *gate]))
+                t2.append(add(2, train_config(args, 2, "potential", s0, v, sg), ["calibration", *gate]))
     if 3 in tiers:
         for s in seeds[1:]:
-            add(3, train_config(args, 3, "baseline", s), gate)
-            add(3, train_config(args, 3, "flow", s, "A1", 0.0), gate)
-            for which in ("best_A1", "best_A2"):
+            add(3, imported(train_config(args, 3, "baseline", s)), gate)
+            add(3, train_config(args, 3, "potential", s, "P1", 0.0), gate)
+            for which in ("best_P1", "best_P2"):
                 plan.append({"id": f"{which.replace('_', '')}{sfx}_seed{s}_e{E}", "tier": 3, "resolve": which,
                              "seed": s, "needs": [*gate, "calibration", which]})
     if 4 in tiers:
-        for v in ("A1", "A2"):
+        for v in ("P1", "P2"):
             for sg in (0.25, 2.0):
-                add(4, train_config(args, 4, "flow", s0, v, sg, final_only=True), ["calibration", *gate])
+                add(4, train_config(args, 4, "potential", s0, v, sg, final_only=True), ["calibration", *gate])
         for lam in (0.03, 0.3):
             plan.append({"id": f"bestT2_lam{lam:g}{sfx}_seed{s0}_e{E}", "tier": 4, "resolve": "best_T2", "lam": lam,
                          "seed": s0, "needs": [*gate, "calibration", "best_T2"]})
         for W in (128, 512):
-            add(4, train_config(args, 4, "flow", s0, "A1", 0.0, W=W, final_only=True), gate)
-        for which in ("best_A1", "best_A2"):
+            add(4, train_config(args, 4, "potential", s0, "P1", 0.0, W=W, final_only=True), gate)
+        for which in ("best_P1", "best_P2"):
             plan.append({"id": f"plansweep_{which.replace('_', '')}_seed{s0}_e{E}", "tier": 4, "resolve": "sweep",
                          "ref": which, "needs": [*gate, which]})
     return plan, {"base0": base0, "ctrl0": ctrl0, "calib": calib_id, "t2": t2}
@@ -208,7 +223,7 @@ class Orchestrator:
         self.jobs_dir = self.out / "jobs"
         self.jobs_dir.mkdir(exist_ok=True)
         self.log = Log(self.out)
-        self.t_start = float(os.environ.get("FM_RUN_START", time.time()))
+        self.t_start = float(os.environ.get("POT_RUN_START", time.time()))
         self.deadline = self.t_start + args.max_hours * 3600 if args.max_hours else None
         self.tiers = [int(t) for t in str(args.tiers).split(",") if t.strip()]
         self.seeds = [int(s) for s in str(args.seeds).split(",") if s.strip()]
@@ -221,12 +236,13 @@ class Orchestrator:
         self.bundle_path = Path(args.bundle_path) if args.bundle_path else (
             ws / "bundle.tar.gz" if ws.is_dir() else Path.cwd() / "bundle.tar.gz")
         self.bundler = Bundler(self)
-        from fm.github_sync import GitHubSync
+        from potential.github_sync import GitHubSync
 
         self.gh = GitHubSync(self.out, log=self.log)
         self.manifest = C.read_json(self.out / "manifest.json") or {}
         self.bench = C.read_json(self.out / "benchmark.json") or {}
         self.seen_milestones = set()
+        self._bridge_dirs = None
 
     # ------------------------------------------------------------------ manifest
     def save_manifest(self):
@@ -270,12 +286,12 @@ class Orchestrator:
         if "config" in slot:
             return slot["config"]
         ch = self.manifest.get("choices", {})
-        if slot["resolve"] in ("best_A1", "best_A2", "best_T2"):
+        if slot["resolve"] in ("best_P1", "best_P2", "best_T2"):
             c = ch.get(slot["resolve"])
             if not c:
                 return None
             lam = slot.get("lam", 0.09)
-            cfg = train_config(self.args, slot["tier"], "flow", slot["seed"], c["variant"], c["sigma"], lam=lam,
+            cfg = train_config(self.args, slot["tier"], "potential", slot["seed"], c["variant"], c["sigma"], lam=lam,
                                final_only=slot["tier"] == 4, job_id=slot["id"])
             cfg["resolved_from"] = {"choice": slot["resolve"], "source_job": c["job_id"]}
             return cfg
@@ -285,7 +301,7 @@ class Orchestrator:
                 return None
             ref = c["job_id"]
             rcfg = self.jentry(ref).get("config") or {}
-            return {"job_id": slot["id"], "tier": 4, "type": "eval_sweep", "ref_job": ref, "kind": "flow",
+            return {"job_id": slot["id"], "tier": 4, "type": "eval_sweep", "ref_job": ref, "kind": "potential",
                     "variant": rcfg.get("variant"), "sigma": rcfg.get("sigma"), "seed": rcfg.get("seed"),
                     "epochs": self.args.epochs, "num_eval": self.args.num_eval,
                     "evals": sweep_evals(self.args, rcfg.get("plan_S") or 4)}
@@ -294,7 +310,7 @@ class Orchestrator:
     def full_config(self, cfg):
         """Job config + things that change its meaning (calibration content for sigma>0)."""
         cfg = dict(cfg)
-        if cfg.get("type") == "train" and cfg.get("kind") == "flow" and float(cfg.get("sigma", 0)) > 0:
+        if cfg.get("type") == "train" and cfg.get("kind") == "potential" and float(cfg.get("sigma", 0)) > 0:
             calib = C.read_json(self.calib_path())
             cfg["calibration_path"] = str(self.calib_path())
             cfg["calibration_hash"] = C.config_hash(calib["delta_std"]) if calib else None
@@ -318,7 +334,7 @@ class Orchestrator:
             elif need == "calibration":
                 if not self.calib_path().exists():
                     return False, "calibration missing"
-            elif need in ("best_A1", "best_A2", "best_T2"):
+            elif need in ("best_P1", "best_P2", "best_T2"):
                 if not ch.get(need):
                     return False, f"{need} not selected"
         return True, ""
@@ -332,7 +348,7 @@ class Orchestrator:
         return self.bench.get("steps_per_epoch") or 13934
 
     def train_type(self, cfg):
-        return "baseline" if cfg.get("kind") == "baseline" else f"flow_W{cfg.get('head_W', 256)}"
+        return "baseline" if cfg.get("kind") == "baseline" else f"potential_W{cfg.get('head_W', 256)}"
 
     def measured_it_s(self, ttype):
         rates = []
@@ -349,10 +365,10 @@ class Orchestrator:
         m = self.measured_it_s(ttype)
         if m:
             return m, "measured"
-        b = (self.bench.get("train") or {}).get(ttype) or (self.bench.get("train") or {}).get("flow_W256" if ttype.startswith("flow") else "baseline")
+        b = (self.bench.get("train") or {}).get(ttype) or (self.bench.get("train") or {}).get("potential_W256" if ttype.startswith("potential") else "baseline")
         if b:
             return b["train_it_s"], "benchmark"
-        return FALLBACK_IT_S["baseline" if ttype == "baseline" else "flow"], "fallback"
+        return FALLBACK_IT_S["baseline" if ttype == "baseline" else "potential"], "fallback"
 
     def val_s_per_epoch(self, ttype):
         """Measured per-epoch val time from metrics.csv of jobs of this type, else the benchmark."""
@@ -388,7 +404,7 @@ class Orchestrator:
         be = self.bench.get("eval") or {}
         if cfg_kind == "baseline" and be.get("baseline"):
             return be["baseline"]["solve_s"].get("1x1", FALLBACK_SOLVE_S)
-        fl = be.get("flow") or {}
+        fl = be.get("potential") or {}
         if fl.get("solve_s", {}).get(f"{S}x{K}"):
             return fl["solve_s"][f"{S}x{K}"]
         base = (be.get("baseline") or {}).get("solve_s", {}).get("1x1", FALLBACK_SOLVE_S)
@@ -399,7 +415,7 @@ class Orchestrator:
     def eval_s(self, cfg_kind, W, S, K, n=None):
         n = n or self.args.num_eval
         be = self.bench.get("eval") or {}
-        b = be.get("flow" if cfg_kind != "baseline" else "baseline") or {}
+        b = be.get("potential" if cfg_kind != "baseline" else "baseline") or {}
         setup = b.get("setup_s", 90.0)
         envo = b.get("env_overhead_s_per_episode", 0.5)
         return setup + n * (2 * self.solve_s(cfg_kind, W, S, K) + envo)
@@ -409,6 +425,8 @@ class Orchestrator:
         cfg = cfg or self.resolve(slot) or self.representative(slot)
         jd = self.jobs_dir / slot["id"]
         t = 0.0
+        if cfg.get("imported_from"):
+            return 0.0 if (remaining_only and (jd / "DONE").exists()) else 5.0
         if cfg.get("type") == "calibrate":
             return 0.0 if (remaining_only and self.calib_path().exists()) else 180.0
         if cfg.get("type") == "train" and not (remaining_only and (jd / "TRAIN_DONE").exists()):
@@ -431,8 +449,8 @@ class Orchestrator:
 
     def representative(self, slot):
         if slot.get("resolve") == "sweep":
-            return {"type": "eval_sweep", "kind": "flow", "evals": sweep_evals(self.args)}
-        return train_config(self.args, slot["tier"], "flow", slot.get("seed", 0), "A2", 1.0,
+            return {"type": "eval_sweep", "kind": "potential", "evals": sweep_evals(self.args)}
+        return train_config(self.args, slot["tier"], "potential", slot.get("seed", 0), "P2", 1.0,
                             final_only=slot["tier"] == 4, job_id=slot["id"])
 
     # ------------------------------------------------------------------ subprocess
@@ -477,7 +495,7 @@ class Orchestrator:
         t0 = time.time()
         if not (jd / "TRAIN_DONE").exists():
             self.current["phase_label"] = "train"
-            cmd = [PY, "-m", "fm.train_fm", "--job_dir", jd, "--val_batches", self.args.val_batches]
+            cmd = [PY, "-m", "potential.train_fm", "--job_dir", jd, "--val_batches", self.args.val_batches]
             if self.train_deadline():
                 cmd += ["--deadline", self.train_deadline()]
             if self.args.num_workers is not None:
@@ -519,7 +537,7 @@ class Orchestrator:
                 self.log(f"missing checkpoint {ckpt} for eval {ev['tag']}")
                 return "failed"
             self.current["phase_label"] = f"eval {ev['tag']}"
-            cmd = [PY, "-m", "fm.eval_fm", "--ckpt", ckpt, "--out", outj, "--num_eval", cfg.get("num_eval", self.args.num_eval),
+            cmd = [PY, "-m", "potential.eval_fm", "--ckpt", ckpt, "--out", outj, "--num_eval", cfg.get("num_eval", self.args.num_eval),
                    "--progress", jd / "eval" / "progress_eval.json"]
             if ev.get("S") is not None:
                 cmd += ["--S", ev["S"], "--K", ev["K"], "--mode", ev["mode"]]
@@ -538,6 +556,61 @@ class Orchestrator:
             self.after_eval()
         return "done"
 
+    def bridge_dirs(self):
+        """--bridge_out sources as local out/ dirs (bundles extracted once under out/bridge_src/)."""
+        if self._bridge_dirs is None:
+            self._bridge_dirs = [C.materialise_out_dir(s, self.out / "bridge_src") for s in self.args.bridge_out]
+        return self._bridge_dirs
+
+    def run_import(self, slot, cfg):
+        """Copy a finished bridge-repo job (baseline training+evals, or the sigma calibration) instead of
+        re-running it. The bridge job must have the same job id, i.e. the same kind/seed/epochs/lambda.
+        Checkpoints are not copied (nothing here needs the baseline weights)."""
+        jid = cfg["job_id"]
+        jd = self.jobs_dir / jid
+        try:
+            srcs = [d for d in self.bridge_dirs() if (d / "jobs" / jid / "DONE").exists()]
+        except FileNotFoundError as ex:
+            self.log(f"[{jid}] import: {ex}")
+            return "failed"
+        if not srcs:
+            self.log(f"[{jid}] import: no finished bridge job '{jid}' in --bridge_out {self.args.bridge_out}. "
+                     f"The baseline is never trained in this repo: pass the bridge results that contain it.")
+            return "failed"
+        src = srcs[0]
+        sj = src / "jobs" / jid
+        bcfg = C.read_json(sj / "config.json") or {}
+        keys = ("type", "kind", "seed", "epochs", "lambda", "num_eval") if cfg["type"] == "train" else ("type", "ref_job", "seed")
+        bad = [f"{k}: bridge {bcfg.get(k)!r} vs here {cfg.get(k)!r}" for k in keys if bcfg.get(k) != cfg.get(k)]
+        if bad:
+            self.log(f"[{jid}] import refused, bridge job differs: {'; '.join(bad)}")
+            return "failed"
+        if cfg["type"] == "train":
+            final = [ev["tag"] for ev in cfg["evals"] if ev["epoch"] == cfg["epochs"]]
+            missing = [t for t in final if not (sj / "eval" / f"{t}.json").exists()]
+            if missing:
+                self.log(f"[{jid}] import refused: bridge job has no final eval {missing}")
+                return "failed"
+        else:
+            calib = C.read_json(src / "calibration.json") or C.read_json(sj / "calibration.json")
+            if not calib or calib.get("source_job") != cfg["ref_job"]:
+                self.log(f"[{jid}] import refused: bridge calibration.json missing or not from {cfg['ref_job']}")
+                return "failed"
+            C.write_json_atomic(self.calib_path(), calib)
+        shutil.copytree(sj, jd, dirs_exist_ok=True, ignore=shutil.ignore_patterns("ckpt", "*.pt", "config.json"))
+        if (sj / "config.json").exists():
+            shutil.copy(sj / "config.json", jd / "bridge_config.json")
+        bman = C.read_json(src / "manifest.json") or {}
+        C.write_json_atomic(jd / "imported_from.json", {
+            "source": str(src), "bridge_out_args": self.args.bridge_out, "bridge_git_commit": bman.get("git_commit"),
+            "bridge_gpu": bman.get("gpu"), "bridge_job_status": (bman.get("jobs", {}).get(jid) or {}).get("status"),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S")})
+        hashes = sorted({(C.read_json(p) or {}).get("eval_set_hash") for p in (jd / "eval").glob("ep*.json")} - {None}) \
+            if (jd / "eval").is_dir() else []
+        self.log(f"[{jid}] imported from bridge results {src} (bridge git {bman.get('git_commit')}"
+                 + (f", eval_set_hash {hashes}" if hashes else "") + ")")
+        return "done"
+
     def run_calibrate(self, slot, cfg):
         jd = self.jobs_dir / cfg["job_id"]
         ref = self.jobs_dir / cfg["ref_job"]
@@ -545,7 +618,7 @@ class Orchestrator:
         if not ckpt.exists():
             self.log(f"calibration: missing {ckpt}")
             return "failed"
-        cmd = [PY, "-m", "fm.calibrate", "--ckpt", ckpt, "--out", self.calib_path(), "--seed", cfg["seed"],
+        cmd = [PY, "-m", "potential.calibrate", "--ckpt", ckpt, "--out", self.calib_path(), "--seed", cfg["seed"],
                "--num_batches", 2 if self.args.debug_steps else cfg["num_batches"]]
         if self.args.num_workers is not None:
             cmd += ["--num_workers", self.args.num_workers]
@@ -594,13 +667,13 @@ class Orchestrator:
                 ch["gate"] = {"verdict": verdict, "baseline": b["success_rate"], "baseline_se": b["se"],
                               "control": c["success_rate"], "control_se": c["se"], "diff": diff, "threshold": thr,
                               "rule": "pass iff control >= baseline - max(2*sqrt(se_b^2+se_c^2), 2 points)"}
-                self.log(f"GATE {verdict.upper()}: baseline {b['success_rate']:.1f}±{b['se']:.1f} vs A1 sigma=0 S=1 "
+                self.log(f"GATE {verdict.upper()}: baseline {b['success_rate']:.1f}±{b['se']:.1f} vs P1 sigma=0 S=1 "
                          f"{c['success_rate']:.1f}±{c['se']:.1f} (diff {diff:+.1f}, threshold -{thr:.1f})")
                 self.save_manifest()
-        # best A1 / A2 (tier 2, seed 0, final success; ties -> lower sigma)
+        # best P1 / P2 (tier 2, seed 0, final success; ties -> lower sigma)
         t2 = ids["t2"]
         if t2 and all(jobs.get(j, {}).get("status") in ("done", "failed") for j in t2):
-            for v in ("A1", "A2"):
+            for v in ("P1", "P2"):
                 key = f"best_{v}"
                 if key in ch:
                     continue
@@ -615,8 +688,8 @@ class Orchestrator:
                     ch[key] = {"variant": v, "sigma": best[3], "job_id": best[2], "success": best[0],
                                "candidates": {c[2]: c[0] for c in cands}}
                     self.log(f"selected {key}: {best[2]} ({best[0]:.1f}%)")
-            if "best_T2" not in ch and ch.get("best_A1") and ch.get("best_A2"):
-                a1, a2 = ch["best_A1"], ch["best_A2"]
+            if "best_T2" not in ch and ch.get("best_P1") and ch.get("best_P2"):
+                a1, a2 = ch["best_P1"], ch["best_P2"]
                 pick = max([(a1["success"], -a1["sigma"], 1, a1), (a2["success"], -a2["sigma"], 0, a2)])[3]
                 ch["best_T2"] = dict(pick, candidates={a1["job_id"]: a1["success"], a2["job_id"]: a2["success"]})
                 self.log(f"selected best_T2: {pick['job_id']}")
@@ -697,7 +770,7 @@ class Orchestrator:
             desc = _describe(cfg) if cfg else f"{s.get('resolve')} -> {s.get('ref', s.get('resolve'))} (TBD)"
             rows.append(f"{i:>3} | T{s['tier']} | {s['id']:<34} | {desc:<44} | {st:<11} | {C.fmt_hms(proj):>9}")
         self.log("JOB PLAN\n  # | tier | job                                | what                                         | status      | projected\n  " + "\n  ".join(rows))
-        src = {t: self.it_s(t)[1] for t in ("baseline", "flow_W256")}
+        src = {t: self.it_s(t)[1] for t in ("baseline", "potential_W256")}
         cost = f" | projected cost ${total / 3600 * self.args.price_per_hour:.2f} at ${self.args.price_per_hour}/h" if self.args.price_per_hour else ""
         self.log(f"projected total {C.fmt_hms(total)} ({total / 3600:.1f} h){cost} | throughput source: {src} | "
                  f"steps/epoch {self.args.debug_steps or self.spe()} | evals {self.args.num_eval} episodes")
@@ -710,10 +783,11 @@ class Orchestrator:
     def run_benchmark(self):
         self.log("BENCHMARK: ~50 training steps per job type + one short eval per eval type (random-init weights)")
         bdir = self.out / "benchmark"
-        types = {"baseline": dict(kind="baseline"), "flow_W256": dict(kind="flow", variant="A2", sigma=1.0, plan_S=4, head_W=256)}
+        # no baseline training benchmark: baseline jobs are imported from the bridge repo, never trained here
+        types = {"potential_W256": dict(kind="potential", variant="P2", sigma=1.0, plan_S=4, head_W=256)}
         if 4 in self.tiers:
-            types["flow_W128"] = dict(kind="flow", variant="A1", sigma=0.0, plan_S=1, head_W=128)
-            types["flow_W512"] = dict(kind="flow", variant="A1", sigma=0.0, plan_S=1, head_W=512)
+            types["potential_W128"] = dict(kind="potential", variant="P1", sigma=0.0, plan_S=1, head_W=128)
+            types["potential_W512"] = dict(kind="potential", variant="P1", sigma=0.0, plan_S=1, head_W=512)
         res = {"gpu": self.manifest.get("gpu"), "train": {}, "eval": {}, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
         calib = bdir / "unit_calibration.json"
         C.write_json_atomic(calib, {"delta_std": [1.0] * 192})
@@ -723,7 +797,7 @@ class Orchestrator:
             cfg = {"job_id": f"bench_{name}", "tier": 0, "type": "train", "seed": 0, "epochs": self.args.epochs,
                    "lambda": 0.09, "milestones": [], "calibration_path": str(calib), **t}
             C.write_json_atomic(jd / "config.json", cfg)
-            cmd = [PY, "-m", "fm.train_fm", "--job_dir", jd, "--benchmark_steps", 50, "--val_batches", 10]
+            cmd = [PY, "-m", "potential.train_fm", "--job_dir", jd, "--benchmark_steps", 50, "--val_batches", 10]
             if self.args.num_workers is not None:
                 cmd += ["--num_workers", self.args.num_workers]
             if self.args.allow_cpu:
@@ -742,15 +816,15 @@ class Orchestrator:
         # eval benchmark on random-init checkpoints from preflight
         pre = self.out / "preflight"
         specs = {"baseline": (pre / "pf_baseline.pt", "1x1"),
-                 "flow": (pre / "pf_A2.pt", "1x1,2x1,4x1,8x1,4x2,4x4" if 4 in self.tiers else "1x1,4x1")}
+                 "potential": (pre / "pf_P2.pt", "1x1,2x1,4x1,8x1,4x2,4x4" if 4 in self.tiers else "1x1,4x1")}
         for name, (ck, bench) in specs.items():
             if not ck.exists():
                 self.log(f"benchmark eval {name}: no checkpoint {ck} (preflight skipped?)")
                 continue
             outj = bdir / f"eval_{name}.json"
             n = 4
-            cmd = [PY, "-m", "fm.eval_fm", "--ckpt", ck, "--out", outj, "--num_eval", n, "--benchmark", bench]
-            if name == "flow":
+            cmd = [PY, "-m", "potential.eval_fm", "--ckpt", ck, "--out", outj, "--num_eval", n, "--benchmark", bench]
+            if name == "potential":
                 cmd += ["--S", 4]
             if self.args.allow_cpu:
                 cmd += ["--device", "cpu"]
@@ -791,7 +865,7 @@ class Orchestrator:
     def check_upload_target(self):
         """Fail fast if results could not leave this (ephemeral) machine."""
         if self.gh.enabled():
-            from fm.github_sync import TAG_PREFIX, GitHubError
+            from potential.github_sync import TAG_PREFIX, GitHubError
 
             try:
                 self.gh.check()
@@ -813,6 +887,24 @@ class Orchestrator:
                  "with https://<token>@github.com/...), or pass --allow_no_upload to run anyway.")
         return False
 
+    def check_bridge_sources(self):
+        """Fail fast: baseline jobs and the calibration are imported from the bridge repo, never run here."""
+        pending = [s["id"] for s in self.plan if (s.get("config") or {}).get("imported_from")
+                   and self.jentry(s["id"]).get("status") != "done"]
+        if not pending or self.args.benchmark:
+            return True
+        if not self.args.bridge_out:
+            self.log(f"NO BRIDGE RESULTS: {pending} are imported from the bridge repo (fm-jepa), never trained here. "
+                     f"Pass --bridge_out <bridge out/ dir or bundle.tar.gz> (repeatable).")
+            return False
+        try:
+            dirs = self.bridge_dirs()
+        except (FileNotFoundError, OSError) as ex:
+            self.log(f"BRIDGE RESULTS UNREADABLE: {ex}")
+            return False
+        self.log(f"bridge results: {[str(d) for d in dirs]} -> importing {pending}")
+        return True
+
     def run(self):
         a = self.args
         self.init_manifest()
@@ -833,10 +925,12 @@ class Orchestrator:
         self.log(self.extension_note())
         if not self.check_upload_target():
             return 1
+        if not self.check_bridge_sources():
+            return 1
 
         if not a.skip_preflight:
             n_train = sum(1 for s in self.plan if (s.get("config") or {}).get("type", "train") == "train")
-            cmd = [PY, "-m", "fm.preflight", "--out", self.out, "--min_free_gb", 5 + 0.6 * n_train]
+            cmd = [PY, "-m", "potential.preflight", "--out", self.out, "--min_free_gb", 5 + 0.6 * n_train]
             if a.allow_cpu:
                 cmd.append("--allow_cpu")
             rc = self.run_sub(cmd, self.out / "preflight.out", None, "preflight")
@@ -904,7 +998,9 @@ class Orchestrator:
             self.current.update(slot=slot, index=idx)
             self.log(f"=== START [{idx}/{len(self.plan)}] {jid} (tier {slot['tier']}): {_describe(cfg)} | projected {C.fmt_hms(proj)}")
             try:
-                if cfg["type"] == "train":
+                if cfg.get("imported_from"):
+                    st = self.run_import(slot, cfg)
+                elif cfg["type"] == "train":
                     st = self.run_train(slot, cfg)
                 elif cfg["type"] == "calibrate":
                     st = self.run_calibrate(slot, cfg)
@@ -950,30 +1046,25 @@ class Orchestrator:
                 return
 
     def maybe_diagnose(self):
+        """The bridge's auto-diagnostic (BatchNorm on the velocity-head output) has no conservative
+        counterpart: normalising U or rescaling grad U per dimension breaks v = -grad U. On a gate
+        failure the potential repo only records the failure; later tiers stay blocked."""
         g = self.manifest.get("choices", {}).get("gate")
         if not g or g["verdict"] != "fail" or self.args.no_auto_diagnose:
             return
         ch = self.manifest["choices"]
-        cfg = self.full_config(train_config(self.args, "D", "flow", self.seeds[0], "A1", 0.0, out_norm="bn"))
-        if any(s["id"] == cfg["job_id"] for s in self.plan):
-            return
-        if not ch.get("diagnosis_job"):
-            ch["diagnosis_job"] = cfg["job_id"]
-            ch["diagnosis"] = ("gate failed; later tiers stopped. Auto-diagnostic: sigma=0 control with BatchNorm on "
-                               "the head output (first fix in the spec). Further candidates if this does not close the "
-                               "gap: lambda (0.03/0.3) and head width (128/512) — run manually with --tiers.")
-            self.log(f"GATE FAILED -> scheduling diagnostic {cfg['job_id']} (out_norm=bn)")
-        self.plan.append({"id": cfg["job_id"], "tier": "D", "config": cfg})
-        self.jentry(cfg["job_id"])["tier"] = "D"
-        if cfg["job_id"] not in self.manifest["order"]:
-            self.manifest["order"].append(cfg["job_id"])
-        self.save_manifest()
+        if not ch.get("diagnosis"):
+            ch["diagnosis"] = ("gate failed; later tiers stopped. No automatic diagnostic job (the bridge's out_norm=bn "
+                               "fix does not apply to a potential). Candidates to run manually with --tiers: "
+                               "lambda (0.03/0.3), head width (128/512), --head_fp32.")
+            self.log("GATE FAILED -> later tiers blocked; no auto-diagnostic for the potential variant")
+            self.save_manifest()
 
     def regen_report(self):
         try:
-            from fm import report
+            from potential import report
 
-            report.build_report(self.out)
+            report.build_report(self.out, bridge_dirs=self.bridge_dirs())
         except Exception as ex:  # noqa: BLE001
             self.log(f"(report generation failed: {ex!r})")
 
@@ -1015,10 +1106,10 @@ class Orchestrator:
         tag = self.manifest.get("github_release_tag")
         if self.gh.enabled() and tag:
             msgs.append(f"  0. GitHub (private draft release '{tag}'): {self.gh.release_url()}\n"
-                        f"     on your machine, inside the repo:  python -m fm.github_sync download --dest out_{tag}\n"
-                        f"     (needs GITHUB_TOKEN or a logged-in gh: GITHUB_TOKEN=$(gh auth token) python -m fm.github_sync ...)")
+                        f"     on your machine, inside the repo:  python -m potential.github_sync download --dest out_{tag}\n"
+                        f"     (needs GITHUB_TOKEN or a logged-in gh: GITHUB_TOKEN=$(gh auth token) python -m potential.github_sync ...)")
         if self.bundler.hf_enabled():
-            msgs.append(f"  1. HF Hub (private): huggingface-cli download {os.environ['HF_REPO']} --local-dir lewm_fm_results "
+            msgs.append(f"  1. HF Hub (private): huggingface-cli download {os.environ['HF_REPO']} --local-dir lewm_potential_results "
                         f"(contains out/ and bundle.tar.gz)")
         else:
             msgs.append("  1. HF Hub: not configured (set HF_TOKEN and HF_REPO to enable automatic upload)")
@@ -1036,7 +1127,7 @@ class Orchestrator:
 
 
 def _describe(cfg):
-    from fm.report import describe
+    from potential.report import describe
 
     try:
         return describe(cfg)
@@ -1162,7 +1253,7 @@ class Bundler:
             return
         gh = getattr(self.o, "gh", None)
         if gh is not None and gh.enabled() and self.o.manifest.get("github_release_tag"):
-            from fm.github_sync import GitHubError
+            from potential.github_sync import GitHubError
 
             try:
                 summary = gh.sync(self.o.manifest["github_release_tag"], final=include_bundle)
