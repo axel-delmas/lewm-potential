@@ -195,3 +195,31 @@ def test_head_fp32_matches_default_in_fp32():
     v0 = model.velocity(x, tau, h, z, a)
     model.head_fp32 = True
     torch.testing.assert_close(model.velocity(x, tau, h, z, a), v0)
+    # under bf16 autocast, head_fp32 must reproduce the fp32 field exactly (incl. the grad call)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        v1 = model.velocity(x, tau, h, z, a)
+        v2 = model.velocity(x, tau, h, z, a, create_graph=True)
+    assert v1.dtype == torch.float32
+    torch.testing.assert_close(v1, v0, rtol=0, atol=0)
+    torch.testing.assert_close(v2.detach(), v0, rtol=0, atol=0)
+
+
+def test_cem_solver_end_to_end():
+    """The PushT eval's CEMSolver.solve runs under @torch.inference_mode(): planning must still work."""
+    swm_solver = pytest.importorskip("stable_worldmodel.solver")
+    gym = pytest.importorskip("gymnasium")
+    from types import SimpleNamespace
+
+    torch.manual_seed(0)
+    model = potential_model(D=D, variant="P2", sigma_mult=1.0, plan_S=2, plan_K=2).eval()
+    randomise_output(model.head)
+    model.requires_grad_(False)
+    n_envs = 2
+    solver = swm_solver.CEMSolver(model=model, num_samples=6, n_steps=2, topk=2, device="cpu", seed=0)
+    solver.configure(action_space=gym.spaces.Box(-1, 1, shape=(n_envs, 2)), n_envs=n_envs,
+                     config=SimpleNamespace(horizon=3, action_block=5))
+    info = {"pixels": torch.randn(n_envs, 1, 3, 8, 8), "goal": torch.randn(n_envs, 1, 3, 8, 8),
+            "action": torch.randn(n_envs, 1, 10)}
+    out = solver.solve(info)
+    acts = out["actions"]
+    assert acts.shape[0] == n_envs and torch.isfinite(torch.as_tensor(acts)).all()

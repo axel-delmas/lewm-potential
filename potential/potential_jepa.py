@@ -30,6 +30,8 @@ TODO (not implemented on purpose): unrolled gradient descent on U as the transit
 (U as an energy whose gradient is the score). Both would replace flow_loss/sample_next only.
 """
 
+import contextlib
+
 import torch
 from einops import rearrange
 
@@ -72,11 +74,17 @@ class PotentialJEPA(JEPA):
         self._plan_gen = None
 
     # ------------------------------------------------------------------ field
+    def _precision(self, x):
+        """head_fp32: run the head (and grad_x U) outside autocast, in fp32."""
+        if not self.head_fp32:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=x.device.type, enabled=False)
+
     def potential(self, x, tau, h, z_t, a):
-        """U(x, tau | h, z_t, a): (N,). head_fp32 runs the head outside autocast."""
+        """U(x, tau | h, z_t, a): (N,)."""
         if not self.head_fp32:
             return self.head(x, tau, h, z_t, a)
-        with torch.autocast(device_type=x.device.type, enabled=False):
+        with self._precision(x):
             return self.head(x.float(), tau.float(), h.float(), z_t.float(), a.float())
 
     def velocity(self, x, tau, h, z_t, a, create_graph=False):
@@ -85,16 +93,19 @@ class PotentialJEPA(JEPA):
         create_graph=True (training): differentiable in the head parameters and in all inputs.
         create_graph=False: works under no_grad / inference_mode; the result is detached.
         """
+        # the grad call sits inside _precision too: on CPU autograd runs the backward on the calling
+        # thread, where an enclosing bf16 autocast would otherwise still apply
         if create_graph:
             assert torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
             xg = x if x.requires_grad else x.detach().requires_grad_(True)
-            U = self.potential(xg, tau, h, z_t, a)
-            (g,) = torch.autograd.grad(U.sum(), xg, create_graph=True)
+            with self._precision(x):
+                U = self.potential(xg, tau, h, z_t, a)
+                (g,) = torch.autograd.grad(U.sum(), xg, create_graph=True)
             return -g
         inf = torch.is_inference_mode_enabled()
         # inference tensors cannot be saved for backward: copy them outside inference mode
         cut = (lambda t: t.detach().clone()) if inf else (lambda t: t.detach())
-        with torch.inference_mode(False), torch.enable_grad():
+        with torch.inference_mode(False), torch.enable_grad(), self._precision(x):
             xg = cut(x).requires_grad_(True)
             U = self.potential(xg, cut(tau), cut(h), cut(z_t), cut(a))
             (g,) = torch.autograd.grad(U.sum(), xg)
