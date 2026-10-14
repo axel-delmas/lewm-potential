@@ -1,3 +1,18 @@
+## Potential variant (this repo) — what differs from the bridge notes below
+- The field is v = −∇ₓU (PotentialHead: scalar output, same conditioning trunk as VelocityHead).
+  P1/P2 use the A1/A2 losses and samplers unchanged. Parameters at W=256: head 3,450,881, total
+  20,692,591 (bridge: 3,499,968 / 20,741,678; baseline 18,034,478).
+- The baseline jobs and `calibration.json` are **imported from the bridge repo's results**
+  (`--bridge_out`), not trained here. They come from the bridge's `fm/train_fm.py`, which is the same
+  trainer as `potential/train_fm.py`. Provenance is in `jobs/<id>/imported_from.json`.
+- The gate is the bridge's rule with P1 σ=0, S=1 as the control. No auto-diagnostic job runs on a
+  gate failure (the bridge's BatchNorm-on-output fix would break v = −∇U).
+- ∇U at planning time is computed outside `inference_mode` (the CEM solver runs inside it) on a
+  detached copy of x. Its result is detached.
+- Everywhere below, read "flow models" as including the potential models, and A1/A2 as P1/P2.
+
+---
+
 ## Step 0 — verification (done before coding)
 
 1. **stable_worldmodel / datasets.** `stable-worldmodel==0.1.1` and `stable-pretraining==0.1.8` (latest on PyPI) are installed by `setup.sh`. The `[format]` extra is replaced by explicit `h5py hdf5plugin imageio`, because its `decord` dependency has no wheel on some platforms. `swm.data.load_dataset(name)` resolves `name` under `$STABLEWM_HOME/datasets/`. The default `$STABLEWM_HOME` is `~/.stable_worldmodel`; the README's `~/.stable-wm` and "files directly under `$STABLEWM_HOME`" are stale. The format is then auto-detected from the suffix: a `*.lance` directory opens `LanceDataset`, a `*.h5` file opens `HDF5Dataset`. Only `<user>/<repo>` names auto-download from the HF Hub, so a bare `pusht_expert_train.lance` (train config) or `pusht_expert_train` (eval config, read with `HDF5Dataset` → `.h5`) has **no automatic download**. Both files are on the HF Hub, and `setup.sh` fetches them as-is:

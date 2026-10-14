@@ -1,3 +1,38 @@
+# LeWM-potential: a conservative-field (v = −∇U) predictor for LeWorldModel
+
+> **This fork.** This repository is the original [LeWorldModel](https://github.com/lucas-maes/le-wm) code
+> (unchanged; its README is below) plus one research variant in `potential/`. That variant is the
+> conservative-field counterpart of the bridge-matching variant in
+> **[github.com/axel-delmas/fm-jepa](https://github.com/axel-delmas/fm-jepa)**.
+
+**What differs from LeWM.**
+- `pred_proj` is removed.
+- The ARPredictor output h_t conditions a small per-pair head. That head defines a stochastic
+  one-step transition p(z_{t+1} | history, a_t), sampled by integrating a velocity field from z_t.
+- Rollouts stay autoregressive. Planning is the same CEM, with K particles per candidate.
+
+**What differs from the bridge variant (fm-jepa).** Only the velocity field.
+- **Bridge:** v = head(x, τ | h_t, z_t, a_t), a free field.
+- **Here:** v = −∇ₓ U(x, τ | h_t, z_t, a_t), the gradient of a learned scalar potential (autograd;
+  double backward in training).
+- `PotentialHead` uses the bridge head's conditioning trunk with a zero-initialised scalar output.
+- **P1/P2** use exactly the bridge's A1/A2 losses and samplers with v = −∇U.
+- Encoder, trunk, SIGReg, optimizer, schedule, bf16, data, eval, CEM, K-particle rollout,
+  σ calibration and the gate are unchanged.
+- The baseline is **not retrained**: it is imported from the bridge repo's results, so both variants
+  are compared with the same baseline on the same eval start states.
+
+**How to run.**
+```bash
+python -m pytest tests -q                                   # CPU unit tests
+bash run_all.sh --tiers 1 --epochs 5 --bridge_out <fm-jepa out/ dir or bundle.tar.gz>   # GPU pod
+python -m potential.report out --bridge_out <same>          # joined report: out/report.md, out/joined_results.csv
+```
+
+Details are in [`potential/README.md`](potential/README.md): design, gradient handling, the bf16
+check, parameter counts, CPU timings, and how results from the two repos are joined.
+
+---
 
 # LeWorldModel
 ### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
