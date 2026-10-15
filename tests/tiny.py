@@ -48,6 +48,8 @@ def trunk_parts(D=16, A=10, img=(3, 8, 8), depth=2, heads=2, dim_head=8, mlp_dim
 
 def potential_model(D=16, W=32, n_blocks=2, variant="P1", sigma_mult=0.0, **kw):
     head = PotentialHead(d=D, W=W, n_blocks=n_blocks, a_dim=D)
+    if variant == "P3":  # bowl centre: same module type as the baseline's pred_proj
+        kw.setdefault("pred_proj", MLP(input_dim=D, output_dim=D, hidden_dim=4 * D, norm_fn=nn.BatchNorm1d))
     return PotentialJEPA(*trunk_parts(D), head=head, variant=variant, sigma_mult=sigma_mult, embed_dim=D, **kw)
 
 

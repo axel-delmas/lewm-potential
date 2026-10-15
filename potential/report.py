@@ -2,7 +2,7 @@
 
 With bridge results (--bridge_out, github.com/axel-delmas/fm-jepa) it also writes
 out/joined_results.csv: every potential eval next to the bridge eval with the same settings
-(P1<->A1, P2<->A2, same sigma multiple / lambda / head width / seed / epochs / S / K / mode),
+(P1<->A1, P2<->A2, P3<->A2, same sigma multiple / lambda / head width / seed / epochs / S / K / mode),
 plus the imported baseline, paired per episode on the shared eval start states.
 
 Usage: python -m potential.report [out] [--bridge_out DIR_OR_BUNDLE ...]
@@ -356,7 +356,7 @@ def build_report(out_dir, bridge_dirs=()):
 
 
 # ----------------------------------------------------------------------------- join with the bridge repo
-BRIDGE_VARIANT = {"P1": "A1", "P2": "A2"}
+BRIDGE_VARIANT = {"P1": "A1", "P2": "A2", "P3": "A2"}  # P3 = A2 loss/sampler, structured U
 
 
 def _key(cfg, e, variant):
@@ -459,7 +459,7 @@ def bridge_section(out_dir, per_job, bridge_dirs):
         for r in rows:
             w.writerow({k: r.get(k) for k in JOIN_KEYS})
     L = ["\n## Comparison with the bridge variant (fm-jepa)\n",
-         "Each potential eval is matched to the bridge eval with the same settings (P1↔A1, P2↔A2; same σ multiple, "
+         "Each potential eval is matched to the bridge eval with the same settings (P1↔A1, P2↔A2, P3↔A2; same σ multiple, "
          "λ, head width, seed, epochs, S, K, mode). Both are evaluated on the same 200 start states "
          "(`eval_set_hash` checked), so the comparison is paired per episode: 'only bridge / only potential' count "
          "episodes solved by one model and not the other; p is an exact two-sided McNemar test. Planning times "

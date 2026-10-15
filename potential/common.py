@@ -227,7 +227,9 @@ def model_config(cfg, job, sigma_std=None):
     mc = OmegaConf.to_container(cfg.model, resolve=True)
     if job["kind"] == "baseline":
         return mc
-    mc.pop("pred_proj")
+    pred_proj = mc.pop("pred_proj")
+    if job["variant"] == "P3":  # bowl centre m = pred_proj(h_t), the baseline's own projector config
+        mc["pred_proj"] = pred_proj
     mc["_target_"] = "potential.potential_jepa.PotentialJEPA"
     mc["head"] = head_cfg(job, int(cfg.embed_dim))
     mc["variant"] = job["variant"]

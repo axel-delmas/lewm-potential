@@ -1,7 +1,7 @@
 """Pre-flight: fail fast before any training.
 
 Checks GPU, both PushT dataset files (exist + load), free disk, one fwd/bwd pass of the
-baseline and the potential models (P1 and P2) on a real batch with the training numerics, and
+baseline and the potential models (P1, P2, P3) on a real batch with the training numerics, and
 an eval smoke test (HDF5 eval dataset + PushT env + CEM) on random-init checkpoints.
 """
 
@@ -96,7 +96,8 @@ def main():
     ckpts = {}
     for job in (dict(job_id="pf_baseline", kind="baseline"),
                 dict(job_id="pf_P1", kind="potential", variant="P1", sigma=0.0, plan_S=1),
-                dict(job_id="pf_P2", kind="potential", variant="P2", sigma=1.0, plan_S=4)):
+                dict(job_id="pf_P2", kind="potential", variant="P2", sigma=1.0, plan_S=4),
+                dict(job_id="pf_P3", kind="potential", variant="P3", sigma=1.0, plan_S=4)):
         try:
             mc = C.model_config(cfg, job, sigma_std=[1.0] * int(cfg.embed_dim))
             torch.manual_seed(0)
@@ -118,7 +119,7 @@ def main():
                 res.setdefault("bf16_field_rel_err", {})[job["job_id"]] = rel = _bf16_field_err(model, o, cfg, device)
                 print(f"[preflight] note: {job['job_id']} grad_x U bf16 vs fp32 relative error {rel:.4f} on a real batch "
                       f"(random non-zero output layer){' -- large: consider --head_fp32' if rel > 0.05 else ''}", flush=True)
-            if job["job_id"] in ("pf_baseline", "pf_P2"):
+            if job["job_id"] in ("pf_baseline", "pf_P2", "pf_P3"):
                 path = pre / f"{job['job_id']}.pt"
                 C.torch_save_atomic({"model": model.state_dict(), "model_cfg": mc, "epoch": 0, "job": job}, path)
                 ckpts[job["job_id"]] = path

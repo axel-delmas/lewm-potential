@@ -19,6 +19,17 @@ Per pair: τ ~ U[0,1], ε ~ N(0, I), and σ is a per-dimension multiple of the c
 |---|---|---|
 | **P1** (= A1 with v = −∇U) | x0 = z_t + σε, x_τ = (1−τ)x0 + τz1, mean‖v − (z1 − x0)‖² | Euler x ← x − dt ∇U, S steps |
 | **P2** (= A2 with v = −∇U) | x_τ = (1−τ)z_t + τz1 + σ√(τ(1−τ))ε, x̂1 = x_τ + (1−τ)v, mean‖x̂1 − z1‖² | Euler–Maruyama, no noise on the last step |
+| **P3** (structured potential) | as P2, with U = ‖x − m‖²/(2(1−τ)) + U_net and m = pred_proj(h_t), so x̂1 = m + (1−τ)v_net | as P2, field (m − x)/(1−τ) − ∇U_net |
+
+**P3** keeps the field exactly conservative, but takes the bulk of the motion out of the gradient path:
+- the bowl's centre m = pred_proj(h_t) is a forward output of the context, with the baseline's own projector
+  (+792,768 params, total 21,485,359);
+- its steepness 1/(1−τ) is the bridge drift, so the bowl alone predicts x̂1 = m and its loss is the baseline's
+  ‖pred_proj(h_t) − z1‖²;
+- U_net (zero-initialised) adds the uncertainty on top.
+
+The motivation comes from the 5-epoch P2 run (27.0 % vs A2 57.5 %). With this trunk, −∇U gives nearly the same
+arrow in every situation (mean cosine 0.92–0.99 between situations, vs 0.01 for the free head).
 
 Not implemented (TODO in `potential_jepa.py`): unrolled gradient descent on U trained end to end,
 and denoising score matching with U as an energy.
@@ -87,7 +98,7 @@ bash run_all.sh --tiers 1 --epochs 5 --bridge_out /path/to/bundle_e5_2026-10-08_
 tail -f out/run.log
 ```
 - **Flags.** Same as the bridge (see its `fm/README.md`), with these differences:
-  - `--t2_variants` defaults to `P1,P2`;
+  - `--t2_variants` defaults to `P1,P2`; `P3` must be requested explicitly (joined to A2 in the report);
   - `--head_fp32` is new;
   - `--bridge_out` is required, because the baseline is never trained here.
 - **Environment.** `FM_*` variables are renamed `POT_*`, `~/.fm_env` becomes `~/.pot_env`, and the

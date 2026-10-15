@@ -15,6 +15,11 @@ Variants (per pair: tau ~ U[0,1], eps ~ N(0, I)); same losses as the bridge's A1
   P2 (Brownian bridge, SDE):    x_tau = (1-tau) z_t + tau z1 + sigma sqrt(tau(1-tau)) eps,
                                 x1_hat = x_tau + (1-tau) v, loss = mean ||x1_hat - z1||^2;
                                 Euler-Maruyama sampling, no noise on the last step.
+  P3 (structured potential):    P2 with U = ||x - m||^2 / (2(1-tau)) + U_net, m = pred_proj(h_t) (the
+                                baseline's projector). The bowl's field (m - x)/(1-tau) is the bridge
+                                drift to m, so x1_hat = m + (1-tau) v_net with v_net = -grad U_net. With
+                                U_net == 0 (its init) the loss is the baseline's ||pred_proj(h_t) - z1||^2
+                                and sampling returns m. Still exactly conservative.
 sigma is a per-dimension vector: sigma_mult * calibrated std of (z_{t+1} - z_t).
 
 Gradients:
@@ -56,9 +61,11 @@ class PotentialJEPA(JEPA):
         plan_seed=0,
         detach_target=False,
         head_fp32=False,
+        pred_proj=None,
     ):
-        super().__init__(encoder, predictor, action_encoder, projector=projector, pred_proj=None)
-        assert variant in ("P1", "P2"), variant
+        super().__init__(encoder, predictor, action_encoder, projector=projector, pred_proj=pred_proj)
+        assert variant in ("P1", "P2", "P3"), variant
+        assert (pred_proj is not None) == (variant == "P3"), "pred_proj (the bowl centre) is used by P3 only"
         self.head = head
         self.variant = variant
         self.detach_target = detach_target
@@ -111,6 +118,17 @@ class PotentialJEPA(JEPA):
             (g,) = torch.autograd.grad(U.sum(), xg)
         return -g.detach()
 
+    def bowl_centre(self, h):
+        """P3: centre m of the quadratic part of U, m = pred_proj(h_t). (N, D)."""
+        return self.pred_proj(h)
+
+    def field(self, x, tau, h, z_t, a, m=None):
+        """Sampling-time field. P3 (m given): -grad of ||x - m||^2 / (2(1-tau)) + U_net."""
+        v = self.velocity(x, tau, h, z_t, a)
+        if m is not None:
+            v = v + (m - x) / (1 - tau).clamp_min(1e-3)[:, None]
+        return v
+
     # ------------------------------------------------------------------ training
     def trunk(self, emb, act_emb):
         """ARPredictor output h (B, T, D); no pred_proj."""
@@ -133,14 +151,17 @@ class PotentialJEPA(JEPA):
         else:
             x_tau = (1 - t) * z_t + t * z1 + sigma * torch.sqrt(t * (1 - t)) * eps
             v = self.velocity(x_tau, tau, h, z_t, a, create_graph=cg)
-            x1_hat = x_tau + (1 - t) * v
+            if self.variant == "P2":
+                x1_hat = x_tau + (1 - t) * v
+            else:  # P3: x_tau + (1-tau) (m - x_tau)/(1-tau) = m, written without the 1/(1-tau)
+                x1_hat = self.bowl_centre(h) + (1 - t) * v
             err = (x1_hat - z1).float().pow(2)
         per_pair = err.mean(-1)
         return per_pair.mean(), per_pair.detach(), tau.detach()
 
     # ------------------------------------------------------------------ sampling
     def n_noise(self, S):
-        """Number of noise vectors per sample: P1 -> 1 (x0), P2 -> S-1 (EM steps)."""
+        """Number of noise vectors per sample: P1 -> 1 (x0), P2/P3 -> S-1 (EM steps)."""
         return 1 if self.variant == "P1" else max(S - 1, 0)
 
     def sample_next(self, h, z_t, a, S=None, noise=None):
@@ -156,10 +177,11 @@ class PotentialJEPA(JEPA):
                 tau = torch.full((n,), k * dt, device=z_t.device)
                 x = x + dt * self.velocity(x, tau, h, z_t, a)
         else:
+            m = self.bowl_centre(h) if self.variant == "P3" else None
             x = z_t
             for k in range(S):
                 tau = torch.full((n,), k * dt, device=z_t.device)
-                x = x + dt * self.velocity(x, tau, h, z_t, a)
+                x = x + dt * self.field(x, tau, h, z_t, a, m)
                 if noise is not None and k < S - 1:
                     x = x + sigma * (dt ** 0.5) * noise[:, k]
         return x.detach()
